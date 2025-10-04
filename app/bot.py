@@ -1,4 +1,4 @@
-import asyncio
+from aiogram.client.default import DefaultBotPropertiesimport asyncio
 import os
 import re
 import tempfile
