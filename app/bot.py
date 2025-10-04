@@ -37,10 +37,9 @@ if not BOT_TOKEN:
 os.makedirs(TMP_DIR, exist_ok=True)
 
 # ---------- CORE OBJECTS ----------
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
-dp = Dispatcher()
-r = Router()
-dp.include_router(r)
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 
 # download semaphore
 dl_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
