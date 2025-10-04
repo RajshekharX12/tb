@@ -51,12 +51,16 @@ rate_limiter = RateLimiter(limit=USER_RATE_LIMIT, window_sec=3600)
 # shared HTTP client for downloads (tuned for concurrency)
 http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(30.0, read=60.0),
-    limits=httpx.Limits(max_keepalive_connections=MAX_CONCURRENT * 2, max_connections=MAX_CONCURRENT * 3),
+    limits=httpx.Limits(
+        max_keepalive_connections=MAX_CONCURRENT * 2,
+        max_connections=MAX_CONCURRENT * 3
+    ),
     follow_redirects=True,
 )
 
+# --- URL pattern for supported TeraBox domains ---
 TERABOX_URL_RE = re.compile(
-    r"https?://(?:www\.)?(?:terabox\.(?:com|app)|1024tera\.com)/[^\s]+",
+    r"https?://(?:www\.)?(?:terabox(?:link)?\.(?:com|app)|1024tera\.com)/[^\s]+",
     re.IGNORECASE,
 )
 
