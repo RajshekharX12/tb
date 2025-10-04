@@ -1,4 +1,4 @@
-from aiogram.client.default import DefaultBotPropertiesimport asyncio
+import asyncio
 import os
 import re
 import tempfile
@@ -6,13 +6,14 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, Command
-from dotenv import load_dotenv
-import httpx
+from aiogram.client.default import DefaultBotProperties
 
 from TeraboxDL import TeraboxDL  # pip install terabox-downloader
 
