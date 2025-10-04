@@ -1,16 +1,17 @@
+# app/bot.py
 import asyncio
 import os
 import re
-import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.types import Message, CallbackQuery, BotCommand
+from aiogram.types import Message, CallbackQuery, BotCommand, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
@@ -30,7 +31,6 @@ MAX_FILE_MB = parse_size_mb(os.getenv("MAX_FILE_MB", "1900"))  # keep < Telegram
 USER_RATE_LIMIT = int(os.getenv("USER_RATE_LIMIT", "3"))       # downloads per hour per user
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))         # concurrent downloads
 TMP_DIR = os.getenv("DOWNLOAD_TMP_DIR", "/tmp/terabox_bot")
-ALLOWED_DOMAINS = {"terabox.com", "terabox.app", "1024tera.com"}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -58,21 +58,18 @@ http_client = httpx.AsyncClient(
     follow_redirects=True,
 )
 
-# --- URL pattern for supported TeraBox domains ---
-TERABOX_URL_RE = re.compile(
-    r"https?://(?:www\.)?(?:terabox(?:link)?\.(?:com|app)|1024tera\.com)/[^\s]+",
-    re.IGNORECASE,
-)
+# --- URL detector (any URL) ---
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
-# ---------- HELPERS ----------
-def is_allowed_domain(url: str) -> bool:
+def is_terabox_host(url: str) -> bool:
+    """Allow any domain that is clearly a TeraBox share (e.g., terabox.com, teraboxlink.com, 1024tera.com, 1024terabox.com, with/without subdomains)."""
     try:
-        from urllib.parse import urlparse
-        netloc = urlparse(url).netloc.lower()
-        return any(d in netloc for d in ALLOWED_DOMAINS)
+        host = urlparse(url).netloc.lower()
+        return ("terabox" in host) or ("1024tera" in host)
     except Exception:
         return False
 
+# ---------- HELPERS ----------
 @asynccontextmanager
 async def limited_download():
     await dl_semaphore.acquire()
@@ -92,13 +89,23 @@ async def set_commands():
 async def extract_file_info(url: str) -> dict:
     """
     Use TeraboxDL to extract file metadata & direct URL.
-    Requires TERABOX_COOKIE: 'lang=...; ndus=...;'
+    If TERABOX_COOKIE is not provided, try best-effort without it (some public links still work).
     """
-    if not TERABOX_COOKIE:
-        return {"error": "Missing TERABOX_COOKIE. Set it in your .env (see /help)."}
-    tb = TeraboxDL(TERABOX_COOKIE)
-    info = tb.get_file_info(url)
-    return info
+    try:
+        if TERABOX_COOKIE:
+            tb = TeraboxDL(TERABOX_COOKIE)
+        else:
+            # Some versions accept no-arg ctor; if not, this will raise TypeError which we handle below.
+            tb = TeraboxDL()
+        info = tb.get_file_info(url)
+        return info or {"error": "No info returned from extractor."}
+    except TypeError:
+        # Library requires a cookie for your installed version.
+        if not TERABOX_COOKIE:
+            return {"error": "Missing TERABOX_COOKIE. Set it in your .env (see /help)."}
+        return {"error": "Extractor init error."}
+    except Exception as e:
+        return {"error": f"Extractor error: {e}"}
 
 async def stream_download(direct_url: str, dest_path: str, progress_msg: Message, display_name: str, total_bytes: Optional[int]):
     """
@@ -173,12 +180,15 @@ async def cb_privacy(c: CallbackQuery):
     await c.answer()
 
 # ---------- MAIN HANDLER: TeraBox link in chat ----------
-@r.message(F.text.regexp(TERABOX_URL_RE))
+# Match any message that contains a URL; we’ll validate host inside.
+@r.message(F.text.func(lambda t: URL_RE.search(t or "") is not None))
 async def handle_terabox(m: Message):
-    url = TERABOX_URL_RE.search(m.text).group(0).strip()
+    match = URL_RE.search(m.text or "")
+    url = match.group(0).strip() if match else ""
 
-    if not is_allowed_domain(url):
-        await m.reply("❌ That URL domain isn't supported.")
+    if not url or not is_terabox_host(url):
+        # Not a terabox-like URL → let user know (and keep generic handler for non-URL texts)
+        await m.reply("❌ That URL domain isn't supported.\nSend a *TeraBox* share link.")
         return
 
     # basic per-user rate limit
@@ -191,13 +201,18 @@ async def handle_terabox(m: Message):
 
     # 1) Extract metadata + direct URL
     info = await extract_file_info(url)
-    if "error" in info:
-        await waiting.edit_text(f"❌ *Error*: {info['error']}\n\nSet TERABOX_COOKIE (see /help).")
+    if "error" in info and info["error"]:
+        await waiting.edit_text(f"❌ *Error*: {info['error']}\n\nSet TERABOX_COOKIE (see /help) or try a public link.")
         return
 
-    name = info.get("file_name") or "file"
-    direct_url = info.get("download_link")
-    size_bytes = info.get("sizebytes") or 0
+    # Normalize expected keys across lib versions
+    name = info.get("file_name") or info.get("name") or "file"
+    direct_url = info.get("download_link") or info.get("download_url")
+    size_bytes = info.get("sizebytes") or info.get("size") or 0
+    try:
+        size_bytes = int(size_bytes)
+    except Exception:
+        size_bytes = 0
     size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
 
     if not direct_url:
@@ -212,12 +227,13 @@ async def handle_terabox(m: Message):
         await waiting.edit_text(
             f"⚠️ File is *too large* for Telegram upload.\n\n"
             f"*Name:* `{name}`\n*Size:* {human_size(size_bytes)}\n\n"
-            f"I've provided a direct link instead.", reply_markup=builder.as_markup(), disable_web_page_preview=True
+            f"I've provided a direct link instead.",
+            reply_markup=builder.as_markup(),
+            disable_web_page_preview=True
         )
         return
 
     # 3) Download + upload with auto-clean
-    #    Keep server clean: use temp dir and delete after send.
     tmp_path = os.path.join(TMP_DIR, f"{int(time.time()*1000)}_{name}")
     progress = await waiting.edit_text(f"⬇️ Starting download…\n`{name}`")
 
@@ -231,12 +247,13 @@ async def handle_terabox(m: Message):
                 total_bytes=size_bytes if size_bytes else None,
             )
 
-        # 4) Send: choose best method
+        # 4) Send: FSInputFile ensures local file upload (not misread as file_id)
         caption = f"{name}\n{human_size(size_bytes)}"
+        file = FSInputFile(tmp_path, filename=name)
         if is_video_ext(name):
-            await m.answer_video(video=tmp_path, caption=caption)
+            await m.answer_video(video=file, caption=caption)
         else:
-            await m.answer_document(document=tmp_path, caption=caption)
+            await m.answer_document(document=file, caption=caption)
 
         try:
             await progress.edit_text("✅ Sent successfully. (Cleaned temporary file.)")
