@@ -35,7 +35,7 @@ from typing import Dict, List, Optional
 # CONFIG — EDIT THESE
 # ══════════════════════════════════════════
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8516330436:AAGQ89mcJ_NqLpAbc3X1I22TNxDMadGdikk"
 API_ID = 29060335
 API_HASH = "b5b12f67224082319e736dc900a2f604"
 OWNER_ID = 7940894807  # Only you can use this bot
