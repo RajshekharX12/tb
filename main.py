@@ -242,6 +242,8 @@ async def run_connect(bot, chat_id, msg_id):
                         link = await get_captured_link(page)
                         if link:
                             tonkeeper_link = link
+                            if tonkeeper_link.startswith("tc://"):
+                                tonkeeper_link = "https://app.tonkeeper.com/ton-connect" + tonkeeper_link[4:]
                             log.info("GOT LINK by clicking %s at (%d,%d): %s",
                                      el['tag'], el['x'], el['y'], link[:80])
                             break
