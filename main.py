@@ -532,17 +532,45 @@ async def cookies_cmd(client, message):
 async def hash_cmd(client, message):
     msg = await message.reply("Fetching...")
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as hc:
+        cookies = state.cookies if state.connected else {}
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True, cookies=cookies) as hc:
             resp = await hc.get(FRAGMENT_BASE, headers={"User-Agent": USER_AGENT})
         if resp.status_code == 200:
-            m = re.search(r'"hash"\s*:\s*"([a-f0-9]{16,})"', resp.text)
-            if m:
-                state.page_hash = m.group(1)
-                return await msg.edit_text("Hash:\n<code>" + m.group(1) + "</code>", parse_mode=ParseMode.HTML)
-        await msg.edit_text("Hash not found.")
+            text = resp.text
+            patterns = [
+                r'"hash"\s*:\s*"([a-f0-9]{16,})"',
+                r"'hash'\s*:\s*'([a-f0-9]{16,})'",
+                r'hash[=:]\s*["\']([a-f0-9]{16,})["\']',
+                r'data-hash="([a-f0-9]{16,})"',
+                r'ajax[^"]*hash[^"]*":\s*"([a-f0-9]{16,})"',
+                r'\?hash=([a-f0-9]{16,})',
+                r'hash=([a-f0-9]{16,})',
+            ]
+            for pat in patterns:
+                m = re.search(pat, text)
+                if m:
+                    state.page_hash = m.group(1)
+                    return await msg.edit_text(
+                        "Hash:\n<code>" + m.group(1) + "</code>",
+                        parse_mode=ParseMode.HTML)
+            # Not found - send debug snippet
+            # Look for anything containing "hash"
+            hash_lines = []
+            for line in text.split("\n"):
+                if "hash" in line.lower() and len(line) < 500:
+                    hash_lines.append(line.strip()[:200])
+            if hash_lines:
+                debug = "\n".join(hash_lines[:10])
+                await msg.edit_text(
+                    "Hash not found by pattern.\n\nLines containing 'hash':\n<code>"
+                    + debug[:3000] + "</code>",
+                    parse_mode=ParseMode.HTML)
+            else:
+                await msg.edit_text("Hash not found. No 'hash' references in page.")
+        else:
+            await msg.edit_text("HTTP " + str(resp.status_code))
     except Exception as e:
         await msg.edit_text("Error: " + str(e))
-
 
 @app.on_callback_query(filters.regex("cancel_connect") & filters.user(OWNER_ID))
 async def cancel_cb(client, query):
