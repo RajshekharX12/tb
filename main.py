@@ -444,79 +444,7 @@ async def run_playwright_connect(app: Client, chat_id: int, status_msg_id: int):
                     log.info("Connected! Cookies: %s", list(stel_cookies.keys()))
                     break
 
-                # Progress update every 30 seconds
-                if i > 0 and i % 10 == 0:
-                    try:
-                        await app.edit_message_text(
-                            chat_id, status_msg_id,
-                            f"⏳ <b>Step 4/5:</b> Waiting for Tonkeeper approval...\n"
-                            f"<i>({i * 3}s elapsed, 5 min timeout)</i>\n\n"
-                            f"👇 Tap below if you haven't yet:",
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton("🔗 Open Tonkeeper", url=tonkeeper_link)],
-                                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_connect")],
-                            ]),
-                        )
-                    except Exception:
-                        pass
-
-            if not connected:
-                await app.edit_message_text(
-                    chat_id, status_msg_id,
-                    "❌ <b>Timeout:</b> No wallet connection received in 5 minutes.\n\n"
-                    "Try again with /connect",
-                    parse_mode=ParseMode.HTML,
-                )
-                await browser.close()
-                return
-
-            # ── Step 5: Fetch numbers ──
-            await app.edit_message_text(
-                chat_id, status_msg_id,
-                "⏳ <b>Step 5/5:</b> Fetching your numbers...",
-                parse_mode=ParseMode.HTML,
-            )
-
-            await page.goto(f"{FRAGMENT_BASE}/my/numbers", wait_until="networkidle")
-            await asyncio.sleep(2)
-
-            html = await page.content()
-            numbers = set()
-            for match in re.findall(r"\+?888\d{4,15}", html):
-                num = match if match.startswith("+") else "+" + match
-                numbers.add(num)
-
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.select("a[href*='/number/']"):
-                href = a.get("href", "")
-                m = re.search(r"(\+?888\d{4,15})", href)
-                if m:
-                    num = m.group(1)
-                    if not num.startswith("+"):
-                        num = "+" + num
-                    numbers.add(num)
-
-            state.numbers = sorted(numbers)
-
-            # Also try to extract the page hash for API calls
-            page_source = await page.content()
-            for pat in [r'"hash"\s*:\s*"([a-f0-9]{16,})"', r"hash['\"]?\s*[:=]\s*['\"]([a-f0-9]{16,})"]:
-                m = re.search(pat, page_source)
-                if m:
-                    state.page_hash = m.group(1)
-                    break
-
-            # Save cookies
-            cookie_path = save_cookies_file(state.cookies, "frag_export.json")
-
-            # Get important tokens
-            stel_tokens = {
-                k: v for k, v in state.cookies.items()
-                if k.startswith("stel_")
-            }
-
-            # ── Report results ──
+            # ── Report results ── (this is the end of run_playwright_connect)
             nums_text = ""
             if state.numbers:
                 for n in state.numbers:
@@ -541,7 +469,10 @@ async def run_playwright_connect(app: Client, chat_id: int, status_msg_id: int):
                 parse_mode=ParseMode.HTML,
             )
 
-  @app.on_message(filters.command("hash") & filters.private & filters.user(OWNER_ID))
+# ⚠️ IMPORTANT: The following lines must NOT be indented
+# They should be at the same level as "async def run_playwright_connect"
+
+@app.on_message(filters.command("hash") & filters.private & filters.user(OWNER_ID))
 async def hash_cmd(client: Client, message: Message):
     status = await message.reply(
         "⏳ Fetching Fragment page hash...",
@@ -585,34 +516,4 @@ async def cancel_connect_cb(client: Client, query: CallbackQuery):
 @app.on_message(filters.private & ~filters.user(OWNER_ID))
 async def block_others(client: Client, message: Message):
     await message.reply("🔒 This bot is private.")
-
-
-# ══════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════
-
-if __name__ == "__main__":
-    print("╔═══════════════════════════════════════════════╗")
-    print("║  Fragment TON Connect Bot — Starting...        ║")
-    print("╚═══════════════════════════════════════════════╝")
-    print()
-
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Edit BOT_TOKEN in the script first!")
-        print("   Get a token from @BotFather on Telegram.")
-        sys.exit(1)
-
-    # Check playwright
-    try:
-        from playwright.async_api import async_playwright
-        print("✅ Playwright installed")
-    except ImportError:
-        print("⚠️  Playwright not installed!")
-        print("   Run: pip install playwright && playwright install chromium")
-        print("   The bot will start but /connect won't work without it.")
-        print()
-
-    print(f"👤 Owner: {OWNER_ID}")
-    print()
-
-    app.run()
+                    
