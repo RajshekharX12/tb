@@ -1,200 +1,177 @@
 import asyncio
+import base64
 import httpx
+import redis.asyncio as redis
 import logging
 import os
-import base64
-from typing import Callable, Awaitable, Optional
+import time
 
-log = logging.getLogger("ton_watcher")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ton_engine")
+
+API = "https://toncenter.com/api/v3"
 
 
-class TonPaymentWatcher:
-    API_URL = "https://toncenter.com/api/v2/getTransactions"
+class TonPaymentEngine:
 
-    def __init__(self, redis, wallet: Optional[str] = None, poll_interval: float = 2.0):
-        self.redis = redis
-        self.wallet = wallet or os.getenv("TON_WALLET")
-        self.api_key = os.getenv("TONCENTER_KEY")
+    def __init__(self, redis_client):
 
-        if not self.wallet:
-            raise ValueError("TON_WALLET env variable missing")
-
-        self.poll_interval = poll_interval
-        self.running = False
-
-        limits = httpx.Limits(
-            max_connections=50,
-            max_keepalive_connections=20,
-            keepalive_expiry=30,
-        )
+        self.redis = redis_client
 
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10),
-            limits=limits,
-            http2=True,
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=0,
+                keepalive_expiry=0
+            ),
+            timeout=10
         )
 
-        self.last_lt_key = f"ton:last_lt:{self.wallet}"
-        self.last_hash_key = f"ton:last_hash:{self.wallet}"
+    async def masterchain_seqno(self):
 
-    async def _get_state(self):
-        lt = await self.redis.get(self.last_lt_key)
-        tx_hash = await self.redis.get(self.last_hash_key)
-
-        if lt:
-            lt = int(lt)
-
-        if tx_hash:
-            tx_hash = tx_hash.decode()
-
-        return lt, tx_hash
-
-    async def _save_state(self, lt: int, tx_hash: str):
-        await self.redis.set(self.last_lt_key, lt)
-        await self.redis.set(self.last_hash_key, tx_hash)
-
-    async def _fetch_transactions(self, limit=20):
-        headers = {}
-        params = {
-            "address": self.wallet,
-            "limit": limit,
-        }
-
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-
-        r = await self.client.get(self.API_URL, params=params, headers=headers)
+        r = await self.client.get(f"{API}/masterchainInfo")
         r.raise_for_status()
 
-        data = r.json()
+        return r.json()["last"]["seqno"]
 
-        if not data.get("ok"):
-            raise RuntimeError("TONCenter returned error")
+    async def block_transactions(self, seqno):
 
-        return data["result"]
+        r = await self.client.get(
+            f"{API}/transactionsByMasterchainBlock",
+            params={"seqno": seqno}
+        )
 
-    async def _tx_lock(self, tx_hash: str):
-        key = f"ton:txlock:{tx_hash}"
-        return await self.redis.set(key, "1", nx=True, ex=86400)
+        r.raise_for_status()
 
-    def _extract_comment(self, msg):
+        return r.json()["transactions"]
+
+    async def tx_seen(self, tx_hash):
+
+        return await self.redis.set(
+            f"ton:tx:seen:{tx_hash}",
+            1,
+            nx=True,
+            ex=365 * 86400
+        )
+
+    async def tracked_wallet(self, wallet):
+
+        return await self.redis.sismember(
+            "ton:wallets",
+            wallet
+        )
+
+    def extract_comment(self, msg):
+
+        data = msg.get("msg_data")
+
+        if not data:
+            return None
+
         try:
-            if not msg:
-                return None
-
-            data = msg.get("msg_data")
-            if not data:
-                return None
 
             if data["@type"] == "msg.dataText":
-                return data.get("text")
+
+                return base64.b64decode(
+                    data.get("text", "")
+                ).decode(errors="ignore").strip()
 
             if data["@type"] == "msg.dataRaw":
-                decoded = base64.b64decode(data["body"])
-                return decoded.decode(errors="ignore")
+
+                body = base64.b64decode(
+                    data.get("body", "")
+                )
+
+                if body[:4] == b"\x00\x00\x00\x00":
+                    body = body[4:]
+
+                return body.decode(errors="ignore").strip()
 
         except Exception:
             return None
 
-    def _extract_amount(self, msg):
-        value = int(msg.get("value", 0))
-        return value / 1e9
+    async def process_tx(self, tx):
 
-    async def _process_tx(self, tx, callback):
-        try:
-            tx_hash = tx["transaction_id"]["hash"]
-            lt = int(tx["transaction_id"]["lt"])
+        in_msg = tx.get("in_msg")
 
-            in_msg = tx.get("in_msg")
+        if not in_msg:
+            return
 
-            if not in_msg:
-                return None
+        wallet = in_msg.get("destination")
 
-            if not await self._tx_lock(tx_hash):
-                return None
+        if not wallet:
+            return
 
-            amount = self._extract_amount(in_msg)
-            comment = self._extract_comment(in_msg)
+        if not await self.tracked_wallet(wallet):
+            return
 
-            await callback(amount, comment, tx_hash)
+        tx_hash = base64.b64decode(tx["hash"]).hex()
 
-            await self._save_state(lt, tx_hash)
+        if not await self.tx_seen(tx_hash):
+            return
 
-            return lt
+        value = int(in_msg.get("value") or 0)
 
-        except Exception:
-            log.exception("TX processing failed")
+        if value <= 0:
+            return
 
-    async def _bootstrap(self):
-        """
-        Prevent historical replay on first start
-        """
-        last_lt, _ = await self._get_state()
+        amount = value / 1e9
 
-        if last_lt:
-            return last_lt
+        comment = self.extract_comment(in_msg)
 
-        txs = await self._fetch_transactions(limit=1)
+        await self.redis.xadd(
+            "ton:payments",
+            {
+                "wallet": wallet,
+                "amount": amount,
+                "comment": comment or "",
+                "tx": tx_hash,
+                "ts": int(time.time())
+            }
+        )
 
-        if not txs:
-            return None
+    async def scan_block(self, seqno):
 
-        tx = txs[0]
+        txs = await self.block_transactions(seqno)
 
-        lt = int(tx["transaction_id"]["lt"])
-        tx_hash = tx["transaction_id"]["hash"]
+        tasks = []
 
-        await self._save_state(lt, tx_hash)
+        for tx in txs:
+            tasks.append(self.process_tx(tx))
 
-        log.info("Watcher bootstrap complete at lt=%s", lt)
+        await asyncio.gather(*tasks)
 
-        return lt
+    async def run(self):
 
-    async def start(self, callback: Callable[[float, str, str], Awaitable[None]]):
-        self.running = True
+        last = await self.redis.get("ton:block:last")
 
-        last_lt = await self._bootstrap()
+        if last:
+            last = int(last)
+        else:
+            last = await self.masterchain_seqno()
 
-        log.info("TON watcher running for %s", self.wallet)
+        while True:
 
-        backoff = 2
+            latest = await self.masterchain_seqno()
 
-        while self.running:
-            try:
-                txs = await self._fetch_transactions()
+            while last < latest:
 
-                if not txs:
-                    await asyncio.sleep(self.poll_interval)
+                last += 1
+
+                lock = await self.redis.set(
+                    f"ton:block:lock:{last}",
+                    1,
+                    nx=True,
+                    ex=60
+                )
+
+                if not lock:
                     continue
 
-                txs.sort(key=lambda x: int(x["transaction_id"]["lt"]))
+                log.info("Scanning block %s", last)
 
-                for tx in txs:
-                    lt = int(tx["transaction_id"]["lt"])
+                await self.scan_block(last)
 
-                    if last_lt and lt <= last_lt:
-                        continue
+                await self.redis.set("ton:block:last", last)
 
-                    new_lt = await self._process_tx(tx, callback)
-
-                    if new_lt:
-                        last_lt = new_lt
-
-                backoff = 2
-                await asyncio.sleep(self.poll_interval)
-
-            except httpx.HTTPError as e:
-                log.error("TON API HTTP error: %s", e)
-
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-            except Exception:
-                log.exception("TON watcher error")
-
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-    async def stop(self):
-        self.running = False
-        await self.client.aclose()
+            await asyncio.sleep(1)
